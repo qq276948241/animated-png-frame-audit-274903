@@ -1,4 +1,5 @@
-
+// pako is a browser global when included via <script>; under Node load it from node_modules
+if(typeof pako === "undefined" && typeof require === "function") { var pako = require("pako"); }
 
 var UPNG = (function() {
 	
@@ -24,35 +25,67 @@ var UPNG = (function() {
 	function toRGBA8(out)
 	{
 		var w = out.width, h = out.height;
-		if(out.tabs.acTL==null) return [decodeImage(out.data, w, h, out).buffer];
-		
+		// static PNG (or a file without animation control chunk): one default image
+		if(out.tabs.acTL==null || out.frames.length==0) return [decodeImage(out.data, w, h, out).buffer];
+
 		var frms = [];
-		if(out.frames[0].data==null) out.frames[0].data = out.data;
-		
-		var len = w*h*4, img = new Uint8Array(len), empty = new Uint8Array(len), prev=new Uint8Array(len);
+		var len = w*h*4;
+		var canvas = new Uint8Array(len);   // logical canvas, starts fully transparent
+		var before = new Uint8Array(len);   // canvas snapshot before the current frame
+		var tile;
+
 		for(var i=0; i<out.frames.length; i++)
 		{
 			var frm = out.frames[i];
+			if(frm.data==null) throw new Error("APNG frame " + i + " has no pixel data");
 			var fx=frm.rect.x, fy=frm.rect.y, fw = frm.rect.width, fh = frm.rect.height;
-			var fdata = decodeImage(frm.data, fw,fh, out);
-			
-			if(i!=0) for(var j=0; j<len; j++) prev[j]=img[j];
-			
-			if     (frm.blend==0) _copyTile(fdata, fw, fh, img, w, h, fx, fy, 0);
-			else if(frm.blend==1) _copyTile(fdata, fw, fh, img, w, h, fx, fy, 1);
-			
-			frms.push(img.buffer.slice(0));
-			
-			if     (frm.dispose==0) {}
-			else if(frm.dispose==1) _copyTile(empty, fw, fh, img, w, h, fx, fy, 0);
-			else if(frm.dispose==2) for(var j=0; j<len; j++) img[j]=prev[j];
+
+			before.set(canvas);  // snapshot the whole canvas *before* rendering this frame
+
+			var fdata = decodeImage(frm.data, fw, fh, out);
+			// blend / replace are confined to the frame rectangle by _copyTile
+			if     (frm.blend==0) _copyTile(fdata, fw, fh, canvas, w, h, fx, fy, 0);
+			else if(frm.blend==1) _copyTile(fdata, fw, fh, canvas, w, h, fx, fy, 1);
+			else throw new Error("invalid blend operator: " + frm.blend);
+
+			// every composited frame is an independent, repeatedly readable buffer
+			frms.push(canvas.buffer.slice(0));
+
+			// disposal is strictly limited to the frame rectangle
+			if     (frm.dispose==0) { /* nothing */ }
+			else if(frm.dispose==1) _clearRect(canvas, w, fx, fy, fw, fh);          // to transparent black
+			else if(frm.dispose==2) _restoreRect(before, canvas, w, fx, fy, fw, fh); // pre-frame content
+			else throw new Error("invalid dispose operator: " + frm.dispose);
 		}
 		return frms;
 	}
+
+	function _clearRect(tb, tw, xoff, yoff, rw, rh)
+	{
+		for(var y=0; y<rh; y++)
+			for(var x=0; x<rw; x++)
+			{
+				var ti = ((yoff+y)*tw + xoff+x) << 2;
+				tb[ti]=0; tb[ti+1]=0; tb[ti+2]=0; tb[ti+3]=0;
+			}
+	}
+	function _restoreRect(src, tb, tw, xoff, yoff, rw, rh)
+	{
+		for(var y=0; y<rh; y++)
+			for(var x=0; x<rw; x++)
+			{
+				var si = ((yoff+y)*tw + xoff+x) << 2, ti = si;
+				tb[si]=src[si]; tb[si+1]=src[si+1]; tb[si+2]=src[si+2]; tb[si+3]=src[si+3];
+			}
+	}
 	function decodeImage(data, w, h, out)
 	{
-		var area = w*h, bpp = _getBPP(out);
+		var area = _safeArea(w, h), bpp = _getBPP(out);
 		var bpl = Math.ceil(w*bpp/8);	// bytes per line
+
+		var need = h * bpl;
+		if(data == null || data.length < need)
+			throw new Error("not enough pixel data: have " + (data ? data.length : 0) + ", need " + need);
 
 		var bf = new Uint8Array(area*4), bf32 = new Uint32Array(bf.buffer);
 		var ctype = out.ctype, depth = out.depth;
@@ -98,7 +131,8 @@ var UPNG = (function() {
 			if(depth==16)  for(var i=0; i<area; i++) {  var qi=i<<2, di=i<<2, gr=data[di];  bf[qi]=gr;  bf[qi+1]=gr;  bf[qi+2]=gr;  bf[qi+3]=data[di+2];  }
 		}
 		else if(ctype==0) {	// gray
-			var tr = out.tabs["tRNS"] ? out.tabs["tRNS"] : -1;
+			var hasTr = out.tabs["tRNS"] != null;
+			var tr = hasTr ? out.tabs["tRNS"] : -1;
 			for(var y=0; y<h; y++) {
 				var off = y*bpl, to = y*w;
 				if     (depth== 1) for(var x=0; x<w; x++) {  var gr=255*((data[off+(x>>>3)]>>>(7 -((x&7)   )))& 1), al=(gr==tr*255)?0:255;  bf32[to+x]=(al<<24)|(gr<<16)|(gr<<8)|gr;  }
@@ -114,207 +148,382 @@ var UPNG = (function() {
 
 
 
+	// hard budget: no single decoded bitmap may exceed 1 GiB of raw samples
+	var MAX_DIM = 0x7fffffff, MAX_RAW_BYTES = 1 << 30;
+
+	var _crcTable = (function() {
+		var tab = new Uint32Array(256);
+		for(var n=0; n<256; n++) {
+			var c = n;
+			for(var k=0; k<8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+			tab[n] = c >>> 0;
+		}
+		return tab;
+	})();
+	function _crc32(buff, off, len) {
+		var c = 0xffffffff;
+		for(var i=0; i<len; i++) c = _crcTable[(c ^ buff[off+i]) & 0xff] ^ (c >>> 8);
+		return (c ^ 0xffffffff) >>> 0;
+	}
+
+	function _safeArea(w, h) {
+		if(!(w >= 1 && h >= 1) || w > MAX_DIM || h > MAX_DIM)
+			throw new Error("invalid image dimensions: " + w + "x" + h);
+		var area = w * h;
+		if(area > MAX_RAW_BYTES) throw new Error("image too large: " + w + "x" + h);
+		return area;
+	}
+
+	var ADAM7_ROW0 = [ 0, 0, 4, 0, 2, 0, 1 ];
+	var ADAM7_COL0 = [ 0, 4, 0, 2, 0, 1, 0 ];
+	var ADAM7_RI   = [ 8, 8, 8, 4, 4, 2, 2 ];
+	var ADAM7_CI   = [ 8, 8, 4, 4, 2, 2, 1 ];
+	function _passSize(pass, w, h) {
+		var sw = 0, sh = 0;
+		var cr = ADAM7_ROW0[pass]; while(cr < h) { cr += ADAM7_RI[pass]; sh++; }
+		var cc = ADAM7_COL0[pass]; while(cc < w) { cc += ADAM7_CI[pass]; sw++; }
+		return [sw, sh];
+	}
+	// exact number of filtered scanline bytes (filter byte included) for w*h
+	function _rawBytes(out, w, h) {
+		var bpp = _getBPP(out);
+		if(out.interlace === 0) return (Math.ceil(w*bpp/8) + 1) * h;
+		var total = 0;
+		for(var p=0; p<7; p++) {
+			var ps = _passSize(p, w, h);
+			if(ps[0] !== 0 && ps[1] !== 0)
+				total += (Math.ceil(ps[0]*bpp/8) + 1) * ps[1];
+		}
+		return total;
+	}
+
+	function _pakoInflateRaw(data, expected) {
+		// exact-sized output: a decompression bomb can never grow the allocation
+		var res = pako.inflateRaw(data, expected != null ? {output:new Uint8Array(expected)} : undefined);
+		if(expected != null && res.length !== expected)
+			throw new Error("inflate length mismatch: got " + res.length + " bytes, expected " + expected);
+		return res;
+	}
+	function _inflate(data, buff) {
+		if(data.length < 2) throw new Error("truncated zlib stream");
+		var expected = buff ? buff.length : null;
+		var res = pako.inflate(data, expected != null ? {output:new Uint8Array(expected)} : undefined);
+		if(expected != null && res.length !== expected)
+			throw new Error("inflate length mismatch: got " + res.length + " bytes, expected " + expected);
+		return res;
+	}
+
+	function _inflateChecked(dd, expected, cgbi) {
+		try {
+			if(cgbi) return _pakoInflateRaw(dd, expected);
+			return _inflate(dd, {length:expected});
+		} catch(e) { throw new Error("invalid compressed data: " + e); }
+	}
+
+	function _decompressStrict(out, dd, w, h) {
+		if(!(dd instanceof Uint8Array)) dd = new Uint8Array(dd);
+		_safeArea(w, h);
+		var expected = _rawBytes(out, w, h);
+		if(expected > MAX_RAW_BYTES) throw new Error("image too large: " + w + "x" + h);
+		var raw = _inflateChecked(dd, expected, !!out.tabs["CgBI"]);
+		if(out.interlace === 0) {
+			// _filterZero packs reconstructed samples tightly at the front; trim filter slots
+			var bpl = Math.ceil(w * _getBPP(out) / 8);
+			var flat = _filterZero(raw, out, 0, w, h);
+			return flat.length === bpl * h ? flat : flat.slice(0, bpl * h);
+		}
+		return _readInterlace(raw, out, w, h);
+	}
+
 	function decode(buff)
 	{
-		var data = new Uint8Array(buff), offset = 8, bin = _bin, rUs = bin.readUshort, rUi = bin.readUint;
-		var out = {tabs:{}, frames:[]};
-		var dd = new Uint8Array(data.length), doff = 0;	 // put all IDAT data into it
-		var fd, foff = 0;	// frames
-		
-		var mgck = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-		for(var i=0; i<8; i++) if(data[i]!=mgck[i]) throw "The input is not a PNG file!";
+		var data;
+		if(buff instanceof Uint8Array) data = buff;
+		else if(buff instanceof ArrayBuffer) data = new Uint8Array(buff);
+		else throw new Error("UPNG.decode expects an ArrayBuffer or Uint8Array");
 
-		while(offset<data.length)
+		var out = {tabs:{}, frames:[]};
+		var mgck = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+		if(data.length < 8) throw new Error("The input is not a PNG file!");
+		for(var i=0; i<8; i++) if(data[i]!=mgck[i]) throw new Error("The input is not a PNG file!");
+
+		var bin = _bin, rUs = bin.readUshort, rUi = bin.readUint;
+
+		// parser state
+		var haveIHDR = false, haveActl = false, sawIend = false;
+		var idatStarted = false, idatEnded = false, fdStarted = false;
+		var dd = null, doff = 0;          // concatenated IDAT (default image)
+		var fd = null, foff = 0;          // fdAT bytes of the frame currently being assembled
+		var nextSeq = 0, frameIdx = 0, numFrames = 0;
+		var offset = 8;
+
+		function flushFrame() {
+			var fr = out.frames[out.frames.length - 1];
+			if(foff === 0) throw new Error("APNG frame " + (out.frames.length - 1) + " contains no fdAT data");
+			fr._z = fd.slice(0, foff);
+			foff = 0;
+		}
+
+		while(offset < data.length)
 		{
-			var len  = bin.readUint(data, offset);  offset += 4;
-			var type = bin.readASCII(data, offset, 4);  offset += 4;
-			//console.log(type,len);
-			
-			if     (type=="IHDR")  {  _IHDR(data, offset, out);  }
-			else if(type=="iCCP")  {
-				var off = offset;  while(data[off]!=0) off++;
-				var nam = bin.readASCII(data,offset,off-offset);
-				var cpr = data[off+1];
-				var fil = data.slice(off+2,offset+len);
-				var res = null;
-				try { res = _inflate(fil); } catch(e) {  res = inflateRaw(fil);  }
-				out.tabs[type] = res;
+			if(sawIend) throw new Error("data found after IEND chunk");
+			if(offset + 8 > data.length) throw new Error("truncated chunk header");
+
+			var len  = rUi(data, offset);
+			var type = bin.readASCII(data, offset + 4, 4);
+			var body = offset + 8, end = body + len;
+			if(end + 4 > data.length) throw new Error("chunk " + type + " extends past end of file");
+
+			// every chunk is CRC-checked before its bytes are trusted
+			var storedCrc = rUi(data, end), calcCrc = _crc32(data, offset + 4, len + 4);
+			if(storedCrc !== calcCrc) throw new Error("CRC mismatch in chunk " + type);
+
+			if(idatStarted && type !== "IDAT") idatEnded = true;
+
+			if     (type=="IHDR") {
+				if(haveIHDR || offset !== 8) throw new Error("IHDR must be the first chunk and appear exactly once");
+				if(len !== 13) throw new Error("invalid IHDR length: " + len);
+				_IHDR(data, body, out);
+				if(out.width < 1 || out.height < 1 || out.width > MAX_DIM || out.height > MAX_DIM)
+					throw new Error("invalid IHDR dimensions: " + out.width + "x" + out.height);
+				if([0,2,3,4,6].indexOf(out.ctype) === -1) throw new Error("unsupported color type: " + out.ctype);
+				var validDepth = {0:[1,2,4,8,16], 2:[8,16], 3:[1,2,4,8], 4:[8,16], 6:[8,16]}[out.ctype];
+				if(validDepth.indexOf(out.depth) === -1)
+					throw new Error("invalid bit depth " + out.depth + " for color type " + out.ctype);
+				if(out.compress !== 0 || out.filter !== 0) throw new Error("unsupported compression/filter method");
+				if(out.interlace !== 0 && out.interlace !== 1) throw new Error("invalid interlace method: " + out.interlace);
+				if(_rawBytes(out, out.width, out.height) > MAX_RAW_BYTES)
+					throw new Error("image too large: " + out.width + "x" + out.height);
+				haveIHDR = true;
 			}
-			else if(type=="CgBI")  {  out.tabs[type] = data.slice(offset,offset+4);  }
-			else if(type=="IDAT") {
-				for(var i=0; i<len; i++) dd[doff+i] = data[offset+i];
-				doff += len;
-			}
-			else if(type=="acTL")  {
-				out.tabs[type] = {  num_frames:rUi(data, offset), num_plays:rUi(data, offset+4)  };
+			else if(type=="acTL") {
+				if(!haveIHDR) throw new Error("acTL before IHDR");
+				if(haveActl) throw new Error("duplicate acTL chunk");
+				if(idatStarted || fdStarted) throw new Error("acTL must precede IDAT and fdAT");
+				if(len !== 8) throw new Error("invalid acTL length: " + len);
+				numFrames = rUi(data, body);
+				var numPlays = rUi(data, body + 4);
+				if(numFrames === 0) throw new Error("acTL declares zero frames");
+				out.tabs[type] = { num_frames:numFrames, num_plays:numPlays };
+				haveActl = true; nextSeq = 0;
 				fd = new Uint8Array(data.length);
 			}
-			else if(type=="fcTL")  {
-				if(foff!=0) {  var fr = out.frames[out.frames.length-1];
-					fr.data = _decompress(out, fd.slice(0,foff), fr.rect.width, fr.rect.height);  foff=0;
-				}
-				var rct = {x:rUi(data, offset+12),y:rUi(data, offset+16),width:rUi(data, offset+4),height:rUi(data, offset+8)};
-				var del = rUs(data, offset+22);  del = rUs(data, offset+20) / (del==0?100:del);
-				var frm = {rect:rct, delay:Math.round(del*1000), dispose:data[offset+24], blend:data[offset+25]};
-				//console.log(frm);
+			else if(type=="fcTL") {
+				if(!haveActl) throw new Error("fcTL chunk without acTL");
+				if(len !== 26) throw new Error("invalid fcTL length: " + len);
+				if(idatStarted && !idatEnded) throw new Error("fcTL must not interrupt the IDAT sequence");
+				var seq = rUi(data, body);
+				if(seq !== nextSeq) throw new Error("invalid APNG sequence number: got " + seq + ", expected " + nextSeq);
+				nextSeq++;
+
+				if(foff !== 0) flushFrame(); // previous frame's fdAT run ends here
+
+				var fw = rUi(data, body + 4),  fh = rUi(data, body + 8);
+				var fx = rUi(data, body + 12), fy = rUi(data, body + 16);
+				if(fw < 1 || fh < 1) throw new Error("fcTL frame rectangle must be non-empty");
+				if(fx > out.width || fy > out.height || fx + fw > out.width || fy + fh > out.height)
+					throw new Error("fcTL rectangle " + fx + "," + fy + " " + fw + "x" + fh + " is outside the " + out.width + "x" + out.height + " canvas");
+				var dnum = rUs(data, body + 20), dden = rUs(data, body + 22);
+				if(dden === 0) dden = 100;
+				var dispose = data[body + 24], blend = data[body + 25];
+				if(dispose < 0 || dispose > 2) throw new Error("invalid dispose operator: " + dispose);
+				if(blend !== 0 && blend !== 1) throw new Error("invalid blend operator: " + blend);
+				if(frameIdx === 0 && blend !== 0) throw new Error("the first frame must use blend operator 0 (SOURCE)");
+
+				var frm = {
+					rect:{x:fx, y:fy, width:fw, height:fh},
+					delay:Math.round(dnum / dden * 1000),
+					delay_num:dnum, delay_den:dden,
+					dispose:dispose, blend:blend,
+					seq:seq, data:null, _z:null
+				};
 				out.frames.push(frm);
+				frameIdx++;
 			}
 			else if(type=="fdAT") {
-				for(var i=0; i<len-4; i++) fd[foff+i] = data[offset+i+4];
-				foff += len-4;
+				if(!haveActl) throw new Error("fdAT chunk without acTL");
+				if(len < 4) throw new Error("invalid fdAT length: " + len);
+				// when an IDAT sequence exists it must be complete; a file with no IDAT at all
+				// (first frame carried by fdAT) is a legal APNG layout
+				if(idatStarted && !idatEnded) throw new Error("fdAT must follow the complete IDAT sequence");
+				if(out.frames.length === 0 || (foff === 0 && out.frames[out.frames.length-1]._z !== null))
+					throw new Error("fdAT without a preceding fcTL");
+				var seq = rUi(data, body);
+				if(seq !== nextSeq) throw new Error("invalid APNG sequence number: got " + seq + ", expected " + nextSeq);
+				nextSeq++;
+				var n = len - 4;
+				if(foff + n > fd.length) throw new Error("frame data overflow");
+				for(var i=0; i<n; i++) fd[foff+i] = data[body+4+i];
+				foff += n; fdStarted = true;
 			}
+			else if(type=="IDAT") {
+				if(!haveIHDR) throw new Error("IDAT before IHDR");
+				if(fdStarted) throw new Error("IDAT is not allowed after fdAT");
+				if(idatEnded) throw new Error("IDAT chunks must be contiguous");
+				if(haveActl && frameIdx === 0) throw new Error("first fcTL must precede IDAT");
+				idatStarted = true;
+				if(dd === null) dd = new Uint8Array(data.length);
+				if(doff + len > dd.length) throw new Error("IDAT overflow");
+				for(var i=0; i<len; i++) dd[doff+i] = data[body+i];
+				doff += len;
+			}
+			else if(type=="iCCP")  {
+				var off = body;  while(data[off]!=0) off++;
+				var nam = bin.readASCII(data, body, off-body);
+				var cpr = data[off+1];
+				var fil = data.slice(off+2, end);
+				var res = null;
+				try { res = _inflate(fil); }
+				catch(e) {
+					try { res = _pakoInflateRaw(fil, null); }
+					catch(e2) { throw new Error("invalid iCCP payload: " + e2); }
+				}
+				out.tabs[type] = res;
+			}
+			else if(type=="CgBI")  {  out.tabs[type] = data.slice(body, end);  }
 			else if(type=="pHYs") {
-				out.tabs[type] = [bin.readUint(data, offset), bin.readUint(data, offset+4), data[offset+8]];
+				if(len !== 9) throw new Error("invalid pHYs length: " + len);
+				out.tabs[type] = [rUi(data, body), rUi(data, body+4), data[body+8]];
 			}
 			else if(type=="cHRM") {
+				if(len !== 32) throw new Error("invalid cHRM length: " + len);
 				out.tabs[type] = [];
-				for(var i=0; i<8; i++) out.tabs[type].push(bin.readUint(data, offset+i*4));
+				for(var i=0; i<8; i++) out.tabs[type].push(rUi(data, body+i*4));
 			}
 			else if(type=="tEXt" || type=="zTXt") {
 				if(out.tabs[type]==null) out.tabs[type] = {};
-				var nz = bin.nextZero(data, offset);
-				var keyw = bin.readASCII(data, offset, nz-offset);
-				var text, tl=offset+len-nz-1;
+				var nz = bin.nextZero(data, body);
+				if(nz >= end) throw new Error("malformed " + type + " chunk");
+				var keyw = bin.readASCII(data, body, nz-body);
+				var text, tl=end-nz-1;
 				if(type=="tEXt") text = bin.readASCII(data, nz+1, tl);
 				else {
-					var bfr = _inflate(data.slice(nz+2,nz+2+tl));
+					var bfr = _inflate(data.slice(nz+2, nz+2+tl));
 					text = bin.readUTF8(bfr,0,bfr.length);
 				}
 				out.tabs[type][keyw] = text;
 			}
 			else if(type=="iTXt") {
 				if(out.tabs[type]==null) out.tabs[type] = {};
-				var nz = 0, off = offset;
-				nz = bin.nextZero(data, off);
-				var keyw = bin.readASCII(data, off, nz-off);  off = nz + 1;
-				var cflag = data[off], cmeth = data[off+1];  off+=2;
-				nz = bin.nextZero(data, off);
-				var ltag = bin.readASCII(data, off, nz-off);  off = nz + 1;
-				nz = bin.nextZero(data, off);
-				var tkeyw = bin.readUTF8(data, off, nz-off);  off = nz + 1;
-				var text, tl=len-(off-offset);
-				if(cflag==0) text  = bin.readUTF8(data, off, tl);
+				var off2 = body;
+				var nz = bin.nextZero(data, off2);
+				if(nz >= end) throw new Error("malformed iTXt chunk");
+				var keyw = bin.readASCII(data, off2, nz-off2);  off2 = nz + 1;
+				var cflag = data[off2], cmeth = data[off2+1];  off2+=2;
+				nz = bin.nextZero(data, off2);
+				var ltag = bin.readASCII(data, off2, nz-off2);  off2 = nz + 1;
+				nz = bin.nextZero(data, off2);
+				var tkeyw = bin.readUTF8(data, off2, nz-off2);  off2 = nz + 1;
+				var text, tl=end-off2;
+				if(cflag==0) text  = bin.readUTF8(data, off2, tl);
 				else {
-					var bfr = _inflate(data.slice(off,off+tl));
+					var bfr = _inflate(data.slice(off2, off2+tl));
 					text = bin.readUTF8(bfr,0,bfr.length);
 				}
 				out.tabs[type][keyw] = text;
 			}
 			else if(type=="PLTE") {
-				out.tabs[type] = bin.readBytes(data, offset, len);
+				if(len === 0 || len % 3 !== 0 || len > 768) throw new Error("invalid PLTE length: " + len);
+				out.tabs[type] = bin.readBytes(data, body, len);
 			}
 			else if(type=="hIST") {
+				if(out.tabs["PLTE"] == null) throw new Error("hIST without PLTE");
 				var pl = out.tabs["PLTE"].length/3;
-				out.tabs[type] = [];  for(var i=0; i<pl; i++) out.tabs[type].push(rUs(data, offset+i*2));
+				if(len !== pl*2) throw new Error("invalid hIST length: " + len);
+				out.tabs[type] = [];  for(var i=0; i<pl; i++) out.tabs[type].push(rUs(data, body+i*2));
 			}
 			else if(type=="tRNS") {
-				if     (out.ctype==3) out.tabs[type] = bin.readBytes(data, offset, len);
-				else if(out.ctype==0) out.tabs[type] = rUs(data, offset);
-				else if(out.ctype==2) out.tabs[type] = [ rUs(data,offset),rUs(data,offset+2),rUs(data,offset+4) ];
-				//else console.log("tRNS for unsupported color type",out.ctype, len);
+				if     (out.ctype==3) {
+					if(out.tabs["PLTE"] == null) throw new Error("tRNS before PLTE");
+					if(len > out.tabs["PLTE"].length) throw new Error("tRNS longer than PLTE");
+					out.tabs[type] = bin.readBytes(data, body, len);
+				}
+				else if(out.ctype==0) { if(len!==2) throw new Error("invalid tRNS length"); out.tabs[type] = rUs(data, body); }
+				else if(out.ctype==2) { if(len!==6) throw new Error("invalid tRNS length"); out.tabs[type] = [ rUs(data,body),rUs(data,body+2),rUs(data,body+4) ]; }
+				else throw new Error("tRNS is not allowed for color type " + out.ctype);
 			}
-			else if(type=="gAMA") out.tabs[type] = bin.readUint(data, offset)/100000;
-			else if(type=="sRGB") out.tabs[type] = data[offset];
-			else if(type=="bKGD")
-			{
-				if     (out.ctype==0 || out.ctype==4) out.tabs[type] = [rUs(data, offset)];
-				else if(out.ctype==2 || out.ctype==6) out.tabs[type] = [rUs(data, offset), rUs(data, offset+2), rUs(data, offset+4)];
-				else if(out.ctype==3) out.tabs[type] = data[offset];
+			else if(type=="gAMA") { if(len!==4) throw new Error("invalid gAMA length"); out.tabs[type] = rUi(data, body)/100000; }
+			else if(type=="sRGB") { if(len!==1) throw new Error("invalid sRGB length"); out.tabs[type] = data[body]; }
+			else if(type=="bKGD") {
+				if     (out.ctype==0 || out.ctype==4) { if(len!==2) throw new Error("invalid bKGD length"); out.tabs[type] = [rUs(data, body)]; }
+				else if(out.ctype==2 || out.ctype==6) { if(len!==6) throw new Error("invalid bKGD length"); out.tabs[type] = [rUs(data, body), rUs(data, body+2), rUs(data, body+4)]; }
+				else if(out.ctype==3) { if(len!==1) throw new Error("invalid bKGD length"); out.tabs[type] = data[body]; }
 			}
 			else if(type=="IEND") {
+				if(len !== 0) throw new Error("invalid IEND length: " + len);
+				sawIend = true;
+				offset = end + 4;
 				break;
 			}
-			//else {  console.log("unknown chunk type", type, len);  out.tabs[type]=data.slice(offset,offset+len);  }
-			offset += len;
-			var crc = bin.readUint(data, offset);  offset += 4;
+			else {
+				// unknown critical chunk (uppercase first letter): refuse instead of ignoring
+				if(type.charCodeAt(0) >= 65 && type.charCodeAt(0) <= 90)
+					throw new Error("unsupported critical chunk: " + type);
+				// unknown ancillary chunk: already CRC-verified, safe to skip
+			}
+			offset = end + 4;
 		}
-		if(foff!=0) {  var fr = out.frames[out.frames.length-1];
-			fr.data = _decompress(out, fd.slice(0,foff), fr.rect.width, fr.rect.height);
-		}	
-		out.data = _decompress(out, dd, out.width, out.height);
-		
+
+		if(!haveIHDR) throw new Error("missing IHDR chunk");
+		if(!sawIend) throw new Error("missing IEND chunk");
+
+		if(haveActl)
+		{
+			if(foff !== 0) flushFrame();
+			if(frameIdx !== numFrames)
+				throw new Error("frame count mismatch: acTL declares " + numFrames + ", found " + frameIdx);
+			var firstUsesIDAT = (dd !== null && doff > 0);
+			for(var f=0; f<out.frames.length; f++) {
+				var fr0 = out.frames[f];
+				if(f === 0 && firstUsesIDAT) continue; // first frame's pixels are the default IDAT stream
+				if(fr0._z == null) throw new Error("APNG frame " + f + " has no pixel data");
+				fr0.data = _decompressStrict(out, fr0._z, fr0.rect.width, fr0.rect.height);
+				fr0._z = null;
+			}
+			// default image: use IDAT when present; otherwise the first frame owns the default image
+			if(firstUsesIDAT) {
+				out.data = _decompressStrict(out, dd.slice(0, doff), out.width, out.height);
+				out.frames[0].data = out.data;
+				out.frames[0].usesDefaultIDAT = true;
+			} else {
+				out.data = out.frames[0].data;
+				out.frames[0].usesDefaultIDAT = false;
+			}
+		}
+		else
+		{
+			if(dd === null || doff === 0) throw new Error("PNG contains no IDAT data");
+			if(out.frames.length !== 0) throw new Error("animation chunks present without acTL");
+			out.data = _decompressStrict(out, dd.slice(0, doff), out.width, out.height);
+		}
+
 		delete out.compress;  delete out.interlace;  delete out.filter;
 		return out;
 	}
 
-	function _decompress(out, dd, w, h) {
-		var time = Date.now();
-		var bpp = _getBPP(out), bpl = Math.ceil(w*bpp/8), buff = new Uint8Array((bpl+1+out.interlace)*h);
-		if(out.tabs["CgBI"]) dd = inflateRaw(dd,buff);
-		else                 dd = _inflate(dd,buff);
-		//console.log(dd.length, buff.length);
-		//console.log(Date.now()-time);
-
-		var time=Date.now();
-		if     (out.interlace==0) dd = _filterZero(dd, out, 0, w, h);
-		else if(out.interlace==1) dd = _readInterlace(dd, out);
-		//console.log(Date.now()-time);
-		return dd;
-	}
-
-	function _inflate(data, buff) {  var out=inflateRaw(new Uint8Array(data.buffer, 2,data.length-6),buff);  return out;  }
 	
-	var inflateRaw=function(){var D=function(){var o=Uint16Array,j=Uint32Array;return{m:new o(16),v:new o(16),
-	d:[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15],o:[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258,999,999,999],
-	z:[0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0,0,0,0],B:new o(32),
-	p:[1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577,65535,65535],
-	w:[0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,0,0],h:new j(32),g:new o(512),s:[],A:new o(32),t:[],k:new o(32768),c:[],
-	a:[],n:new o(32768),e:[],C:new o(512),b:[],i:new o(1<<15),r:new j(286),f:new j(30),l:new j(19),u:new j(15e3),q:new o(1<<16),j:new o(1<<15)}}();
-function C(o,j){var I=o.length,A,r,i,y,G,f=D.v;for(var y=0;y<=j;y++)f[y]=0;for(y=1;y<I;y+=2)f[o[y]]++;
-var a=D.m;A=0;f[0]=0;for(r=1;r<=j;r++){A=A+f[r-1]<<1;a[r]=A}for(i=0;i<I;i+=2){G=o[i+1];if(G!=0){o[i]=a[G];
-a[G]++}}}function t(o,j,I){var A=o.length,r=D.i;for(var i=0;i<A;i+=2)if(o[i+1]!=0){var y=i>>1,G=o[i+1],f=y<<4|G,a=j-G,k=o[i]<<a,N=k+(1<<a);
-while(k!=N){var x=r[k]>>>15-j;I[x]=f;k++}}}function g(o,j){var I=D.i,A=15-j;for(var r=0;r<o.length;r+=2){var i=o[r]<<j-o[r+1];
-o[r]=I[i]>>>A}}(function(){var o=1<<15;for(var j=0;j<o;j++){var I=j;I=(I&2863311530)>>>1|(I&1431655765)<<1;
-I=(I&3435973836)>>>2|(I&858993459)<<2;I=(I&4042322160)>>>4|(I&252645135)<<4;I=(I&4278255360)>>>8|(I&16711935)<<8;
-D.i[j]=(I>>>16|I<<16)>>>17}function A(r,i,y){while(i--!=0)r.push(0,y)}for(var j=0;j<32;j++){D.B[j]=D.o[j]<<3|D.z[j];
-D.h[j]=D.p[j]<<4|D.w[j]}A(D.s,144,8);A(D.s,255-143,9);A(D.s,279-255,7);A(D.s,287-279,8);C(D.s,9);t(D.s,9,D.g);
-g(D.s,9);A(D.t,32,5);C(D.t,5);t(D.t,5,D.A);g(D.t,5);A(D.b,19,0);A(D.c,286,0);A(D.e,30,0);A(D.a,320,0)}());
-function F(o,j,I){return(o[j>>>3]|o[(j>>>3)+1]<<8)>>>(j&7)&(1<<I)-1}function s(o,j,I){return(o[j>>>3]|o[(j>>>3)+1]<<8|o[(j>>>3)+2]<<16)>>>(j&7)&(1<<I)-1}
-function w(o,j){return(o[j>>>3]|o[(j>>>3)+1]<<8|o[(j>>>3)+2]<<16)>>>(j&7)}function b(o,j){return(o[j>>>3]|o[(j>>>3)+1]<<8|o[(j>>>3)+2]<<16|o[(j>>>3)+3]<<24)>>>(j&7)}
-function v(o,j){var I=Uint8Array,r=0,i=0,y=0,G=0,f=0,a=0,k=0,N=0,x=0,P,J;
-if(o[0]==3&&o[1]==0)return j?j:new I(0);var A=j==null;if(A)j=new I(o.length>>>2<<3);while(r==0){r=s(o,x,1);
-i=s(o,x+1,2);x+=3;if(i==0){if((x&7)!=0)x+=8-(x&7);var K=(x>>>3)+4,m=o[K-4]|o[K-3]<<8;if(A)j=H(j,N+m);
-j.set(new I(o.buffer,o.byteOffset+K,m),N);x=K+m<<3;N+=m;continue}if(A)j=H(j,N+(1<<17));if(i==1){P=D.g;
-J=D.A;a=(1<<9)-1;k=(1<<5)-1}if(i==2){y=F(o,x,5)+257;G=F(o,x+5,5)+1;f=F(o,x+10,4)+4;x+=14;var O=x,Q=1;
-for(var p=0;p<38;p+=2){D.b[p]=0;D.b[p+1]=0}for(var p=0;p<f;p++){var l=F(o,x+p*3,3);D.b[(D.d[p]<<1)+1]=l;
-if(l>Q)Q=l}x+=3*f;C(D.b,Q);t(D.b,Q,D.C);P=D.k;J=D.n;x=B(D.C,(1<<Q)-1,y+G,o,x,D.a);var u=d(D.a,0,y,D.c);
-a=(1<<u)-1;var n=d(D.a,y,G,D.e);k=(1<<n)-1;C(D.c,u);t(D.c,u,P);C(D.e,n);t(D.e,n,J)}while(!0){var h=P[w(o,x)&a];
-x+=h&15;var L=h>>>4;if(L>>>8==0){j[N++]=L}else if(L==256){break}else{var M=N+L-254;if(L>264){var z=D.B[L-257];
-M=N+(z>>>3)+F(o,x,z&7);x+=z&7}var e=J[w(o,x)&k];x+=e&15;var E=e>>>4,c=D.h[E],q=(c>>>4)+s(o,x,c&15);x+=c&15;
-if(A)j=H(j,N+(1<<17));while(N<M){j[N]=j[N++-q];j[N]=j[N++-q];j[N]=j[N++-q];j[N]=j[N++-q]}N=M}}}return j.length==N?j:j.slice(0,N)}function H(o,j){var I=o.length;
-if(j<=I)return o;var A=new Uint8Array(Math.max(I<<1,j));A.set(o,0);return A}function B(o,j,I,A,r,i){var y=0;
-while(y<I){var G=o[w(A,r)&j];r+=G&15;var f=G>>>4;if(f<=15){i[y]=f;y++}else{var a=0,k=0;if(f==16){k=3+F(A,r,2);
-r+=2;a=i[y-1]}else if(f==17){k=3+F(A,r,3);r+=3}else if(f==18){k=11+F(A,r,7);r+=7}var N=y+k;while(y<N){i[y]=a;
-y++}}}return r}function d(o,j,I,A){var r=0,i=0,y=A.length>>>1;while(i<I){var G=o[i+j];A[i<<1]=0;A[(i<<1)+1]=G;
-if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 
 
-	function _readInterlace(data, out)
+
+	function _readInterlace(data, out, w, h)
 	{
-		var w = out.width, h = out.height;
 		var bpp = _getBPP(out), cbpp = bpp>>3, bpl = Math.ceil(w*bpp/8);
 		var img = new Uint8Array( h * bpl );
 		var di = 0;
 
-		var starting_row  = [ 0, 0, 4, 0, 2, 0, 1 ];
-		var starting_col  = [ 0, 4, 0, 2, 0, 1, 0 ];
-		var row_increment = [ 8, 8, 8, 4, 4, 2, 2 ];
-		var col_increment = [ 8, 8, 4, 4, 2, 2, 1 ];
-
 		var pass=0;
 		while(pass<7)
 		{
-			var ri = row_increment[pass], ci = col_increment[pass];
-			var sw = 0, sh = 0;
-			var cr = starting_row[pass];  while(cr<h) {  cr+=ri;  sh++;  }
-			var cc = starting_col[pass];  while(cc<w) {  cc+=ci;  sw++;  }
+			var ri = ADAM7_RI[pass], ci = ADAM7_CI[pass];
+			var ps = _passSize(pass, w, h), sw = ps[0], sh = ps[1];
+			if(sw === 0 || sh === 0) { pass++; continue; }
 			var bpll = Math.ceil(sw*bpp/8);
 			_filterZero(data, out, di, sw, sh);
 
-			var y=0, row = starting_row[pass];
+			var y=0, row = ADAM7_ROW0[pass];
 			while(row<h)
 			{
-				var col = starting_col[pass];
+				var col = ADAM7_COL0[pass];
 				var cdi = (di+y*bpll)<<3;
 
 				while(col<w)
@@ -339,7 +548,7 @@ if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 				}
 				y++;  row += ri;
 			}
-			if(sw*sh!=0) di += sh * (1 + bpll);
+			di += sh * (1 + bpll);
 			pass = pass + 1;
 		}
 		return img;
@@ -354,15 +563,18 @@ if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 	{
 		var bpp = _getBPP(out), bpl = Math.ceil(w*bpp/8);
 		bpp = Math.ceil(bpp/8);
-		
+
 		var i,di, type=data[off], x=0;
-		
-		if(type>1) data[off]=[0,0,1][type-2];  
+		if(type < 0 || type > 4) throw new Error("invalid row filter byte: " + type);
+
+		if(type>1) data[off]=[0,0,1][type-2];
 		if(type==3) for(x=bpp; x<bpl; x++) data[x+1] = (data[x+1] + (data[x+1-bpp]>>>1) )&255;
 
 		for(var y=0; y<h; y++)  {
 			i = off+y*bpl; di = i+y+1;
+			if(di > data.length) throw new Error("filtered row " + y + " is out of bounds");
 			type = data[di-1]; x=0;
+			if(type < 0 || type > 4) throw new Error("invalid row filter byte: " + type);
 
 			if     (type==0)   for(; x<bpl; x++) data[i+x] = data[di+x];
 			else if(type==1) { for(; x<bpp; x++) data[i+x] = data[di+x];
@@ -407,27 +619,35 @@ if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 				
 				if     (mode==0) {  tb[ti] = sb[si];  tb[ti+1] = sb[si+1];  tb[ti+2] = sb[si+2];  tb[ti+3] = sb[si+3];  }
 				else if(mode==1) {
-					var fa = sb[si+3]*(1/255), fr=sb[si]*fa, fg=sb[si+1]*fa, fb=sb[si+2]*fa; 
-					var ba = tb[ti+3]*(1/255), br=tb[ti]*ba, bg=tb[ti+1]*ba, bb=tb[ti+2]*ba; 
-					
+					var sa = sb[si+3];
+					if(sa === 0) continue; // fully transparent source must never alter the backdrop
+					if(sa === 255 || tb[ti+3] === 0) { // SOURCE wins outright
+						tb[ti] = sb[si]; tb[ti+1] = sb[si+1]; tb[ti+2] = sb[si+2]; tb[ti+3] = sa;
+						continue;
+					}
+					// SVG "over" compositing with unpremultiplied 8-bit samples
+					var fa = sa*(1/255), fr=sb[si]*fa, fg=sb[si+1]*fa, fb=sb[si+2]*fa;
+					var ba = tb[ti+3]*(1/255), br=tb[ti]*ba, bg=tb[ti+1]*ba, bb=tb[ti+2]*ba;
+
 					var ifa=1-fa, oa = fa+ba*ifa, ioa = (oa==0?0:1/oa);
-					tb[ti+3] = 255*oa;  
-					tb[ti+0] = (fr+br*ifa)*ioa;  
-					tb[ti+1] = (fg+bg*ifa)*ioa;   
-					tb[ti+2] = (fb+bb*ifa)*ioa;  
+					tb[ti+3] = 255*oa;
+					tb[ti+0] = (fr+br*ifa)*ioa;
+					tb[ti+1] = (fg+bg*ifa)*ioa;
+					tb[ti+2] = (fb+bb*ifa)*ioa;
 				}
 				else if(mode==2){	// copy only differences, otherwise zero
-					var fa = sb[si+3], fr=sb[si], fg=sb[si+1], fb=sb[si+2]; 
-					var ba = tb[ti+3], br=tb[ti], bg=tb[ti+1], bb=tb[ti+2]; 
+					var fa = sb[si+3], fr=sb[si], fg=sb[si+1], fb=sb[si+2];
+					var ba = tb[ti+3], br=tb[ti], bg=tb[ti+1], bb=tb[ti+2];
 					if(fa==ba && fr==br && fg==bg && fb==bb) {  tb[ti]=0;  tb[ti+1]=0;  tb[ti+2]=0;  tb[ti+3]=0;  }
 					else {  tb[ti]=fr;  tb[ti+1]=fg;  tb[ti+2]=fb;  tb[ti+3]=fa;  }
 				}
-				else if(mode==3){	// check if can be blended
-					var fa = sb[si+3], fr=sb[si], fg=sb[si+1], fb=sb[si+2]; 
-					var ba = tb[ti+3], br=tb[ti], bg=tb[ti+1], bb=tb[ti+2]; 
+				else if(mode==3){	// strict check: every differing pixel must be safely over-compositable
+					var fa = sb[si+3], fr=sb[si], fg=sb[si+1], fb=sb[si+2];
+					var ba = tb[ti+3], br=tb[ti], bg=tb[ti+1], bb=tb[ti+2];
 					if(fa==ba && fr==br && fg==bg && fb==bb) continue;
-					//if(fa!=255 && ba!=0) return false;
-					if(fa<220 && ba>20) return false;
+					// OVER reproduces the source exactly only for fully opaque source pixels;
+					// transparent or partial-alpha differences must use SOURCE instead
+					if(fa !== 255) return false;
 				}
 			}
 		return true;
@@ -462,13 +682,14 @@ if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 					if (c & 1)  c = 0xedb88320 ^ (c >>> 1);
 					else        c = c >>> 1;
 				}
-				tab[n] = c;  }
+				tab[n] = c >>> 0;  }
 			return tab;  })(),
 		update : function(c, buf, off, len) {
-			for (var i=0; i<len; i++)  c = crcLib.table[(c ^ buf[off+i]) & 0xff] ^ (c >>> 8);
+			c = c >>> 0;
+			for (var i=0; i<len; i++)  c = (crcLib.table[(c ^ buf[off+i]) & 0xff] ^ (c >>> 8)) >>> 0;
 			return c;
 		},
-		crc : function(b,o,l)  {  return crcLib.update(0xffffffff,b,o,l) ^ 0xffffffff;  }
+		crc : function(b,o,l)  {  return (crcLib.update(0xffffffff,b,o,l) ^ 0xffffffff) >>> 0;  }
 	}
 	
 	
@@ -569,11 +790,44 @@ if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 		return out;
 	}
 
+	// convert milliseconds to a legal fcTL delay fraction (both terms fit in u16)
+	function _delayFraction(ms) {
+		if(typeof ms !== "number" || !isFinite(ms) || ms < 0) ms = 0;
+		ms = Math.round(ms);
+		if(ms === 0) return [0, 1000];
+		if(ms <= 65535) return [ms, 1000];
+		if(ms % 1000 === 0) {
+			var s = ms / 1000;
+			if(s <= 65535) return [s, 1];
+			return [65535, 1];
+		}
+		// find the largest sub-second denominator that keeps both terms inside u16
+		for(var den = 1000; den >= 1; den--) {
+			var num = Math.round(ms * den / 1000);
+			if(num >= 1 && num <= 65535) return [num, den];
+		}
+		return [65535, 1];
+	}
+
 	function _main(nimg, w, h, dels, tabs) {
 		if(tabs==null) tabs={};
+		if(dels==null) dels=[];
 		var crc = crcLib.crc, wUi = _bin.writeUint, wUs = _bin.writeUshort, wAs = _bin.writeASCII;
 		var offset = 8, anim = nimg.frames.length>1, pltAlpha = false;
-		
+
+		// legalize/validate every frame before a single byte of output is written
+		for(var jv=0; jv<nimg.frames.length; jv++) {
+			var fv = nimg.frames[jv], rv = fv.rect;
+			if(rv.width < 1 || rv.height < 1 || rv.x < 0 || rv.y < 0
+				|| rv.x + rv.width > w || rv.y + rv.height > h)
+				throw new Error("frame " + jv + " rectangle is outside the canvas");
+			if(fv.dispose !== 0 && fv.dispose !== 1 && fv.dispose !== 2)
+				throw new Error("frame " + jv + " has an invalid dispose operator: " + fv.dispose);
+			if(fv.blend !== 0 && fv.blend !== 1)
+				throw new Error("frame " + jv + " has an invalid blend operator: " + fv.blend);
+			if(jv === 0) fv.blend = 0; // the first frame is rendered over an empty canvas: must be SOURCE
+		}
+
 		var cicc;
 		
 		var leng = 8 + (16+5+4) /*+ (9+4)*/ + (anim ? 20 : 0);
@@ -666,6 +920,7 @@ if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 		{
 			var fr = nimg.frames[j];
 			if(anim) {
+				var frac = _delayFraction(dels[j]);
 				wUi(data, offset, 26);     offset+=4;
 				wAs(data, offset,"fcTL");  offset+=4;
 				wUi(data, offset, fi++);   offset+=4;
@@ -673,8 +928,8 @@ if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 				wUi(data, offset, fr.rect.height);   offset+=4;
 				wUi(data, offset, fr.rect.x);   offset+=4;
 				wUi(data, offset, fr.rect.y);   offset+=4;
-				wUs(data, offset, dels[j]);   offset+=2;
-				wUs(data, offset,  1000);   offset+=2;
+				wUs(data, offset, frac[0]);   offset+=2;  // delay numerator (seconds)
+				wUs(data, offset, frac[1]);   offset+=2;  // delay denominator
 				data[offset] = fr.dispose;  offset++;	// dispose
 				data[offset] = fr.blend  ;  offset++;	// blend
 				wUi(data,offset,crc(data,offset-30,30));  offset+=4; // crc
@@ -919,7 +1174,7 @@ if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 		var opts;  if(levelZero) opts={level:0};
 		
 		
-		var CMPR = (data.length>10e6 && window.UZIP!=null) ? window.UZIP : pako;
+		var CMPR = (typeof window !== "undefined" && data.length>10e6 && window.UZIP!=null) ? window.UZIP : pako;
 		
 		var time = Date.now();
 		for(var i=0; i<ftry.length; i++) {
@@ -1223,3 +1478,6 @@ if(G>r)r=G;i++}while(i<y){A[i<<1]=0;A[(i<<1)+1]=0;i++}return r}return v}();
 	UPNG.quantize.getNearest=getNearest;
 })();
 
+
+if(typeof module !== "undefined" && module.exports) module.exports = UPNG;
+if(typeof globalThis !== "undefined") globalThis.UPNG = UPNG;

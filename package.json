@@ -19,6 +19,9 @@
     "image",
     "conversion"
   ],
+  "scripts": {
+    "test": "node test/run-tests.js"
+  },
   "dependencies": {
     "pako": "^1.0.5"
   }

@@ -57,6 +57,28 @@ Supports all color types (including Grayscale and Palettes), all channel depths 
 
 PNG files may have a various number of channels and a various color depth. The interpretation of `data` depends on the current color type and color depth (see the [PNG specification](https://www.w3.org/TR/PNG/)).
 
+The decoded `data` is always the raw, unfiltered scanline bytes in the file's own
+bit depth and color type. 16-bit samples stay as big-endian byte pairs (they are
+not quantized to 8 bit), palette `tRNS` alpha, grayscale alpha and sub-byte
+packed samples are all preserved. Conversion to 8-bit RGBA happens only inside
+`toRGBA8`. For APNG files, every element of `frames` keeps its own raw `data`,
+its `rect`, `delay` (plus `delay_num` / `delay_den`), `blend`, `dispose` and
+`seq`; `frames[0].usesDefaultIDAT` tells whether the first frame occupies the
+default IDAT stream or is carried in `fdAT`.
+
+#### Decoding strictness
+
+`decode` validates the structure before trusting any bytes and throws a stable
+`Error` (never a partially filled image) on malformed input. It checks the
+signature, per-chunk CRC, chunk lengths and ordering, IHDR color type / bit depth
+/ interlace legality, APNG `acTL` frame counts, `fcTL` / `fdAT` sequence
+numbers (duplicates and gaps are rejected), frame-rectangle bounds, blend /
+dispose operators, row filter bytes, and the exact inflate length. Decoded
+bitmap sizes are bounded before allocation so decompression bombs and
+width*height overflows fail early. APNG disposal is applied strictly inside the
+frame rectangle, fully transparent OVER samples never alter the backdrop, and
+each composited frame is returned as an independent, repeatedly readable buffer.
+
 #### `UPNG.toRGBA8(img)`
 * `img`: PNG image object (returned by UPNG.decode())
 * returns an array of frames. A frame is ArrayBuffer of the image in RGBA format, 8 bits per channel.
@@ -65,7 +87,30 @@ PNG files may have a various number of channels and a various color depth. The i
     var img  = UPNG.decode(buff);        // put ArrayBuffer of the PNG file into UPNG.decode
     var rgba = UPNG.toRGBA8(img)[0];     // UPNG.toRGBA8 returns array of frames, size: width * height * 4 bytes.
 
-PNG format uses the Inflate algorithm. Right now, UPNG.js calls [Pako.js](https://github.com/nodeca/pako) for the Inflate and Deflate method.
+PNG format uses the Inflate algorithm. UPNG.js uses [Pako.js](https://github.com/nodeca/pako) for both Inflate and Deflate (it is the single declared dependency, loaded automatically under Node and expected as a global in the browser).
+
+## Usage under Node
+
+UPNG.js works unchanged in Node and exports itself as a CommonJS module:
+
+    npm install
+    var UPNG = require("./UPNG.js");
+    var fs  = require("fs");
+    var img  = UPNG.decode(fs.readFileSync("animation.png").buffer);
+    var rgba = UPNG.toRGBA8(img);   // one RGBA8 ArrayBuffer per composited frame
+
+## Tests
+
+The offline test suite builds small reference PNG/APNG fixtures independently of
+UPNG (Pako only supplies zlib), composites expected frames with a separate
+oracle, and asserts pixel-exact results plus stable errors for corrupt streams.
+It covers every color type and bit depth, Adam7 (static and interlaced APNG
+sub-frames), palette / grayscale transparency, 16-bit big-endian preservation,
+all disposal and blend operators, localized transparency, sequence-number and
+frame-count mismatches, CRC and inflate failures, dimension budgets, and
+encode/decode round-trips including loop counts and sub-millisecond-safe delays.
+
+    npm test
 
 ## Quantizer
 
